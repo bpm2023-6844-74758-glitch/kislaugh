@@ -1,0 +1,510 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:supabase_flutter/supabase_flutter.dart'; // <-- Added for Cloud Fallback
+import '../../theme/app_colors.dart';
+import '../../providers/inventory_provider.dart';
+import '../../providers/settings_provider.dart';
+import '../../providers/navigation_provider.dart'; // <-- Added to track tab changes
+import '../../services/database_helper.dart';
+
+enum TimeView { daily, weekly, monthly }
+
+class AnalysisScreen extends ConsumerStatefulWidget {
+  const AnalysisScreen({super.key});
+
+  @override
+  ConsumerState<AnalysisScreen> createState() => _AnalysisScreenState();
+}
+
+class _AnalysisScreenState extends ConsumerState<AnalysisScreen> {
+  double _activeRate = 12.35;
+  double _targetBudget = 0.0;
+  bool _isLoading = true;
+  bool _showFormulas = false;
+  String _sortOrder = 'Highest kWh';
+  TimeView _selectedView = TimeView.daily;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  // --- THE FIX: Robust Local/Cloud Fetch Engine ---
+  Future<void> _loadSettings() async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      final user = Supabase.instance.client.auth.currentUser;
+
+      // 1. Read Local SQLite First (Fast)
+      final settings = await db.query('user_settings', limit: 1);
+      double localBudget = 0.0;
+      double localRate = 0.0;
+
+      if (settings.isNotEmpty) {
+        localBudget = (settings.first['monthly_budget'] as num).toDouble();
+        localRate = (settings.first['tariff_rate'] as num).toDouble();
+      }
+
+      final pastBills = await db.query('recording_periods', orderBy: 'period_month DESC', limit: 1);
+      if (pastBills.isNotEmpty) {
+        localRate = (pastBills.first['billing_rate'] as num).toDouble();
+      }
+
+      // 2. Cloud Fallback: If SQLite was wiped/empty during login, pull directly from Supabase
+      if (localBudget <= 0 && user != null) {
+        final profile = await Supabase.instance.client.from('profiles').select('monthly_budget').eq('id', user.id).maybeSingle();
+        if (profile != null && profile['monthly_budget'] != null) {
+          localBudget = (profile['monthly_budget'] as num).toDouble();
+          
+          // Re-cache it locally so we don't have to keep downloading it
+          final existing = await db.query('user_settings', where: 'id = 1');
+          if (existing.isEmpty) {
+            await db.insert('user_settings', {'id': 1, 'monthly_budget': localBudget, 'tariff_rate': 0.0});
+          } else {
+            await db.update('user_settings', {'monthly_budget': localBudget}, where: 'id = 1');
+          }
+        }
+
+        final periods = await Supabase.instance.client.from('recording_periods').select('billing_rate').eq('user_id', user.id).order('period_month', ascending: false).limit(1);
+        if (periods.isNotEmpty) {
+          localRate = (periods.first['billing_rate'] as num).toDouble();
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _targetBudget = localBudget;
+          _activeRate = localRate > 0 ? localRate : 12.35;
+        });
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _isLoading = false);
+  }
+
+  String _formatTime(double totalHours) {
+    final int hours = totalHours.floor();
+    final int minutes = ((totalHours - hours) * 60).round();
+    if (hours > 0 && minutes > 0) return '${hours}h ${minutes}m';
+    if (hours > 0) return '${hours}h';
+    return '${minutes}m';
+  }
+
+  IconData _getApplianceIcon(String name) {
+    final lower = name.toLowerCase();
+    if (lower.contains('aircon') || lower.contains('ac')) return Icons.ac_unit;
+    if (lower.contains('fan')) return Icons.mode_fan_off_outlined;
+    if (lower.contains('tv') || lower.contains('television')) return Icons.tv;
+    if (lower.contains('fridge') || lower.contains('refrigerator')) return Icons.kitchen;
+    if (lower.contains('light') || lower.contains('bulb')) return Icons.lightbulb_outline;
+    if (lower.contains('wash')) return Icons.local_laundry_service_outlined;
+    if (lower.contains('laptop') || lower.contains('computer')) return Icons.computer;
+    return Icons.electrical_services;
+  }
+
+  Widget _buildTimeOfDayHeader(bool isPh, Color textColor, Color hintColor) {
+    final hour = DateTime.now().hour;
+    String greeting;
+    IconData timeIcon;
+    List<Color> gradientColors;
+
+    if (hour < 12) {
+      greeting = isPh ? 'Magandang Umaga' : 'Good Morning';
+      timeIcon = Icons.wb_sunny_rounded;
+      gradientColors = [Colors.orange.shade300, Colors.yellow.shade500];
+    } else if (hour < 17) {
+      greeting = isPh ? 'Magandang Hapon' : 'Good Afternoon';
+      timeIcon = Icons.brightness_5_rounded;
+      gradientColors = [Colors.deepOrange.shade400, Colors.orange.shade300];
+    } else {
+      greeting = isPh ? 'Magandang Gabi' : 'Good Evening';
+      timeIcon = Icons.nights_stay_rounded;
+      gradientColors = [Colors.indigo.shade400, Colors.deepPurple.shade400];
+    }
+
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(colors: gradientColors, begin: Alignment.topLeft, end: Alignment.bottomRight),
+            shape: BoxShape.circle,
+            boxShadow: [BoxShadow(color: gradientColors.first.withOpacity(0.4), blurRadius: 12, offset: const Offset(0, 4))],
+          ),
+          child: Icon(timeIcon, color: Colors.white, size: 28),
+        ),
+        const SizedBox(width: 16),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(greeting, style: TextStyle(fontSize: 14, color: hintColor, letterSpacing: 0.5)),
+            Text(isPh ? 'Pagsusuri' : 'Analysis', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: textColor, letterSpacing: 0.5)),
+          ],
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // THE FIX: Listen to Tab Changes. If the user taps the Analysis Tab (Index 2), silently refresh the budget!
+    ref.listen(dashboardTabProvider, (previous, next) {
+      if (next == 2) {
+        _loadSettings();
+      }
+    });
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final textColor = Theme.of(context).colorScheme.onSurface;
+    final hintColor = textColor.withOpacity(0.6);
+    final surfaceColor = Theme.of(context).colorScheme.surface;
+    final isPh = ref.watch(settingsProvider).language == 'ph';
+
+    final Color successColor = isDark ? Colors.greenAccent : Colors.green.shade700;
+    final Color warningColor = isDark ? AppColors.adminRed : Colors.red.shade700;
+    final Color neutralColor = isDark ? AppColors.appYellow : Colors.orange.shade800;
+
+    if (_isLoading) {
+      return const Scaffold(backgroundColor: Colors.transparent, body: Center(child: CircularProgressIndicator(color: AppColors.appYellow)));
+    }
+
+    final devices = ref.watch(inventoryProvider);
+
+    double originalDailyKwh = 0;
+    double optimizedDailyKwh = 0;
+
+    for (var device in devices) {
+      final double kw = (device.presetWattage * device.quantity) / 1000;
+      originalDailyKwh += kw * device.userAssignedHours;
+      optimizedDailyKwh += kw * device.adjustedHours;
+    }
+
+    List<dynamic> sortedDevices = List.from(devices);
+    if (_sortOrder == 'Highest kWh') {
+      sortedDevices.sort((a, b) => ((b.presetWattage * b.quantity * b.adjustedHours)).compareTo(a.presetWattage * a.quantity * a.adjustedHours));
+    } else if (_sortOrder == 'Lowest kWh') {
+      sortedDevices.sort((a, b) => ((a.presetWattage * a.quantity * a.adjustedHours)).compareTo(b.presetWattage * b.quantity * b.adjustedHours));
+    } else if (_sortOrder == 'Name (A-Z)') {
+      sortedDevices.sort((a, b) => a.customName.toString().toLowerCase().compareTo(b.customName.toString().toLowerCase()));
+    }
+
+    final double optimizedWeeklyKwh = optimizedDailyKwh * 7;
+    final double optimizedMonthlyKwh = optimizedDailyKwh * 30;
+
+    final double originalMonthlyCost = (originalDailyKwh * 30) * _activeRate;
+    final double optimizedDailyCost = optimizedDailyKwh * _activeRate;
+    final double optimizedWeeklyCost = optimizedWeeklyKwh * _activeRate;
+    final double optimizedMonthlyCost = optimizedMonthlyKwh * _activeRate;
+
+    final double monthlySavings = originalMonthlyCost - optimizedMonthlyCost;
+    
+    // This is now accurate because _targetBudget is safely managed
+    final bool isOverBudget = _targetBudget > 0 && optimizedMonthlyCost > _targetBudget;
+    final bool isSaving = monthlySavings > 0;
+
+    String trendTitle = '';
+    String trendDesc = '';
+    Color trendColor = successColor;
+    IconData trendIcon = Icons.trending_down;
+
+    if (isOverBudget) {
+      trendColor = warningColor;
+      trendIcon = Icons.warning_amber_rounded;
+      trendTitle = isPh ? 'Sumobra sa Budget' : 'Budget Exceeded';
+      trendDesc = isPh
+          ? 'Kahit na may optimization, ang iyong mga naka-lock na appliances ay lalampas sa ₱${_targetBudget.toStringAsFixed(0)} na budget. Maaari mong i-unlock ang ilang gamit.'
+          : 'Even with optimization, your essential (locked) appliances exceed your ₱${_targetBudget.toStringAsFixed(0)} budget. Consider unlocking items.';
+    } else if (isSaving) {
+      trendColor = successColor;
+      trendIcon = Icons.trending_down;
+      trendTitle = isPh ? 'Bumaba ang Konsumo' : 'Decreased Usage Trend';
+      trendDesc = isPh
+          ? 'Dahil sa optimization, nakatipid ka ng ₱${monthlySavings.toStringAsFixed(0)} sa inaasahang buwanang bill. Pasok na pasok ka sa iyong budget.'
+          : 'By optimizing your schedule, your projected monthly bill decreases by ₱${monthlySavings.toStringAsFixed(0)}. You are staying safely within your budget.';
+    } else {
+      trendColor = neutralColor;
+      trendIcon = Icons.trending_flat;
+      trendTitle = isPh ? 'Walang Bawas sa Konsumo' : 'Stable Usage Trend';
+      trendDesc = isPh
+          ? 'Ang iyong orihinal na konsumo ay pasok na sa iyong budget. Walang binawas na oras sa iyong mga appliances.'
+          : 'Your unregulated usage is already within your budget. No operating hours were reduced.';
+    }
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
+        bottom: false,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.only(left: 24, right: 24, top: 30, bottom: 120),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildTimeOfDayHeader(isPh, textColor, hintColor),
+              const SizedBox(height: 25),
+
+              Text(
+                isPh ? 'PAGSUSURI NG TREND' : 'TREND ANALYSIS',
+                style: TextStyle(color: hintColor, fontSize: 11, letterSpacing: 1.2, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: isDark ? trendColor.withOpacity(0.1) : trendColor.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: isDark ? trendColor.withOpacity(0.3) : trendColor.withOpacity(0.5)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(trendIcon, color: trendColor, size: 28),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(trendTitle, style: TextStyle(color: trendColor, fontWeight: FontWeight.bold, fontSize: 16)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      trendDesc,
+                      style: TextStyle(
+                        color: isDark ? textColor : trendColor.withOpacity(0.9),
+                        fontSize: 13, height: 1.4, fontWeight: isDark ? FontWeight.normal : FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 30),
+
+              Text(
+                isPh ? 'KABUUANG KONSUMO' : 'HOUSEHOLD TOTALS',
+                style: TextStyle(color: hintColor, fontSize: 11, letterSpacing: 1.2, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: isDark ? surfaceColor.withOpacity(0.5) : Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: isDark ? Colors.white12 : Colors.black.withOpacity(0.05)),
+                  boxShadow: isDark ? [] : [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 4))],
+                ),
+                child: Column(
+                  children: [
+                    _buildSummaryRow(isPh ? 'Araw-araw' : 'Daily', optimizedDailyKwh, optimizedDailyCost, textColor, hintColor),
+                    Divider(color: isDark ? Colors.white12 : Colors.black12, height: 24),
+                    _buildSummaryRow(isPh ? 'Lingguhan' : 'Weekly', optimizedWeeklyKwh, optimizedWeeklyCost, textColor, hintColor),
+                    Divider(color: isDark ? Colors.white12 : Colors.black12, height: 24),
+                    _buildSummaryRow(isPh ? 'Buwanan' : 'Monthly', optimizedMonthlyKwh, optimizedMonthlyCost, neutralColor, hintColor, isBold: true),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 30),
+
+              GestureDetector(
+                onTap: () => setState(() => _showFormulas = !_showFormulas),
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: isDark ? neutralColor.withOpacity(0.05) : Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: isDark ? neutralColor.withOpacity(0.3) : Colors.black.withOpacity(0.05)),
+                    boxShadow: isDark ? [] : [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 4))],
+                  ),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.calculate_outlined, color: neutralColor, size: 22),
+                              const SizedBox(width: 12),
+                              Text(
+                                isPh ? 'PAANO KINAKALKULA NG KISLAP' : 'HOW KISLAP COMPUTES',
+                                style: TextStyle(color: neutralColor, fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.0),
+                              ),
+                            ],
+                          ),
+                          Icon(_showFormulas ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, color: hintColor),
+                        ],
+                      ),
+                      if (_showFormulas) ...[
+                        const SizedBox(height: 16),
+                        Divider(color: isDark ? neutralColor.withOpacity(0.2) : Colors.black12),
+                        const SizedBox(height: 16),
+                        _buildMathRow(
+                          isPh ? '1. Kuryente (kWh)' : '1. Consumption (kWh)',
+                          isPh ? 'Paano kinukuha ang pang-araw-araw na konsumo:' : 'How daily power usage is determined:',
+                          '(Wattage × Quantity ÷ 1000) × Hours', textColor, hintColor, isDark, successColor,
+                        ),
+                        const SizedBox(height: 16),
+                        _buildMathRow(
+                          isPh ? '2. Optimization (Pagbawas)' : '2. Optimization Engine',
+                          isPh ? 'Kung lampas sa budget, binabawasan nang pantay-pantay ang oras ng mga naka-unlock na gamit. Ang mga naka-lock (🔒) ay hindi ginagalaw.' : 'If over budget, unlocked items are reduced proportionally to fit the financial limit. Locked items (🔒) are never touched.',
+                          'Remaining Budget ÷ Unlocked kWh', textColor, hintColor, isDark, successColor,
+                        ),
+                        const SizedBox(height: 16),
+                        _buildMathRow(
+                          isPh ? '3. Est. Bayad (Cost)' : '3. Estimated Cost',
+                          isPh ? 'Pinararami ang konsumo sa halaga ng kuryente sa inyong rehiyon.' : 'Multiplying the total power used by your local grid utility rate.',
+                          'Total kWh × Tariff Rate (₱/kWh)', textColor, hintColor, isDark, successColor,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 30),
+
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    isPh ? 'DETALYENG GASTUSIN' : 'APPLIANCE BREAKDOWN',
+                    style: TextStyle(color: hintColor, fontSize: 11, letterSpacing: 1.2, fontWeight: FontWeight.bold),
+                  ),
+                  PopupMenuButton<String>(
+                    icon: Icon(Icons.sort, color: hintColor, size: 20),
+                    color: isDark ? Colors.grey.shade900 : Colors.white,
+                    onSelected: (val) => setState(() => _sortOrder = val),
+                    itemBuilder: (context) => [
+                      PopupMenuItem(value: 'Highest kWh', child: Text(isPh ? 'Pinakamataas na kWh' : 'Highest kWh', style: TextStyle(color: textColor, fontSize: 13))),
+                      PopupMenuItem(value: 'Lowest kWh', child: Text(isPh ? 'Pinakamababang kWh' : 'Lowest kWh', style: TextStyle(color: textColor, fontSize: 13))),
+                      PopupMenuItem(value: 'Name (A-Z)', child: Text(isPh ? 'Pangalan (A-Z)' : 'Name (A-Z)', style: TextStyle(color: textColor, fontSize: 13))),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              ...sortedDevices.map((device) {
+                final bool isReduced = device.adjustedHours < device.userAssignedHours;
+                final Color statusColor = device.isLocked ? neutralColor : (isReduced ? Colors.orange : successColor);
+
+                final double devKw = (device.presetWattage * device.quantity) / 1000;
+                final double devDailyKwh = devKw * device.adjustedHours;
+                final double devWeeklyKwh = devDailyKwh * 7;
+                final double devMonthlyKwh = devDailyKwh * 30;
+
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 16),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: isDark ? surfaceColor.withOpacity(0.4) : Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: device.isLocked ? neutralColor.withOpacity(0.4) : (isDark ? Colors.white12 : Colors.black.withOpacity(0.05))),
+                    boxShadow: isDark ? [] : [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 10, offset: const Offset(0, 4))],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(color: statusColor.withOpacity(0.1), shape: BoxShape.circle),
+                            child: Icon(_getApplianceIcon(device.customName), color: statusColor, size: 20),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('${device.customName} (x${device.quantity})', style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 15)),
+                                Text(
+                                  isPh ? 'Lakas: ${device.presetWattage.toStringAsFixed(0)}W  |  Target: ${_formatTime(device.userAssignedHours)}' : 'Power: ${device.presetWattage.toStringAsFixed(0)}W  |  Target: ${_formatTime(device.userAssignedHours)}',
+                                  style: TextStyle(color: hintColor, fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Text(_formatTime(device.adjustedHours), style: TextStyle(color: statusColor, fontSize: 16, fontWeight: FontWeight.bold)),
+                              Text(device.isLocked ? (isPh ? 'Naka-lock' : 'Locked') : (isReduced ? (isPh ? 'Binawasan' : 'Reduced') : (isPh ? 'Na-optimize' : 'Optimized')), style: TextStyle(color: hintColor, fontSize: 10)),
+                            ],
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(color: isDark ? Colors.black12 : Colors.grey.shade100, borderRadius: BorderRadius.circular(12)),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            _buildStatCol(isPh ? 'Arawan' : 'Daily', devDailyKwh, devDailyKwh * _activeRate, textColor, hintColor, successColor),
+                            _buildStatCol(isPh ? 'Lingguhan' : 'Weekly', devWeeklyKwh, devWeeklyKwh * _activeRate, textColor, hintColor, successColor),
+                            _buildStatCol(isPh ? 'Buwanan' : 'Monthly', devMonthlyKwh, devMonthlyKwh * _activeRate, textColor, hintColor, successColor),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSummaryRow(String label, double kwh, double cost, Color textColor, Color hintColor, {bool isBold = false}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: TextStyle(color: hintColor, fontSize: isBold ? 14 : 13, fontWeight: isBold ? FontWeight.bold : FontWeight.normal)),
+        Row(
+          children: [
+            Text('${kwh.toStringAsFixed(1)} kWh', style: TextStyle(color: hintColor, fontSize: 13)),
+            const SizedBox(width: 16),
+            SizedBox(
+              width: 80,
+              child: Text('₱${cost.toStringAsFixed(2)}', textAlign: TextAlign.right, style: TextStyle(color: textColor, fontSize: isBold ? 16 : 14, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatCol(String label, double kwh, double cost, Color textColor, Color hintColor, Color successColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: TextStyle(color: hintColor, fontSize: 10, letterSpacing: 0.5)),
+        const SizedBox(height: 4),
+        Text('${kwh.toStringAsFixed(2)} kWh', style: TextStyle(color: textColor, fontSize: 12, fontWeight: FontWeight.bold)),
+        Text('₱${cost.toStringAsFixed(0)}', style: TextStyle(color: successColor, fontSize: 12, fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+
+  Widget _buildMathRow(String title, String desc, String formula, Color textColor, Color hintColor, bool isDark, Color successColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: TextStyle(color: textColor, fontSize: 14, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        Text(desc, style: TextStyle(color: hintColor, fontSize: 12, height: 1.4)),
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: isDark ? Colors.black26 : Colors.grey.shade100,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: isDark ? Colors.transparent : Colors.black.withOpacity(0.05)),
+          ),
+          child: Text(formula, style: TextStyle(color: successColor, fontSize: 12, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+        ),
+      ],
+    );
+  }
+}
